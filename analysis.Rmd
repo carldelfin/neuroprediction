@@ -1,0 +1,665 @@
+---
+title: "Prediction of recidivism in a long-term follow-up of forensic psychiatric patients: Incremental effects of neuroimaging data"
+author: "Carl Delfin"
+date: "4 january 2017"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+# Introduction
+
+This is an RMarkdown document containing the R code used for all data analysis in the study *Prediction of recidivism in a long-term follow-up of forensic psychiatric patients: Incremental effects of neuroimaging data*. Externally sourced scripts are located in the *scripts* folder.
+
+# Clear environment
+
+Clear any existing data, values and functions from the global environment.
+
+```{r}
+rm(list = ls())
+```
+
+# Start timer
+
+Not really necessary, but I want to keep track of total running time for the entire analysis pipeline.
+
+```{r}
+timer <- proc.time()
+```
+
+# Set-up
+
+Initial set up, such as setting up paths, loading packages and reading data.
+
+## Paths
+
+My paths (e.g. to data) are stored in an external script for security reasons. Every variable written in ALL CAPS is a pre-defined path/key.
+
+```{r}
+source("secret/paths.R")
+```
+
+## Load packages 
+
+All required packages are stored in a vector.
+
+```{r}
+requiredPackages <- c("foreign", "psych", "Barnard", "caret", "randomForest", "ROCR", "ggplot2", "cowplot", "pdp", "DescTools")
+```
+
+The `ipak` script goes through the *requiredPackages* list of packages and checks if they are installed, installs them if not, then loads them.
+
+```{r}
+source("scripts/ipak.R")
+ipak(requiredPackages)
+```
+
+## Data and seed
+
+The data is read from an SPSS file, and the seed is set for reproducibility (I always use the year the analysis was conducted, in this case 2017, to avoid "seed hacking").
+
+```{r, message=FALSE, warning=FALSE}
+data <- read.spss(DATALOCATION, to.data.frame = TRUE)
+seed <- 2017
+```
+
+## Numeric to factor
+
+Reading SPSS data sometimes turns factor variables to numeric ones, which must be manually corrected.
+
+```{r}
+# baseline risk factors
+data$male <- as.factor(data$male)
+data$SUD <- as.factor(data$SUD)
+data$PDB <- as.factor(data$PDB)
+data$education <- as.factor(data$education)
+data$MDFDR <- as.factor(data$MDFDR)
+data$prevcrimeall <- as.factor(data$prevcrimeall)
+
+# primary DSM-IV diagnosis
+data$primarydsmdiagnosis <- as.factor(data$primarydsmdiagnosis)
+data$primarydsm_psychosis <- as.factor(data$primarydsm_psychosis)
+data$primarydsm_mood <- as.factor(data$primarydsm_mood)
+data$primarydsm_pd <- as.factor(data$primarydsm_pd)
+data$primarydsm_DDA <- as.factor(data$primarydsm_DDA)
+data$primarydsm_NDD <- as.factor(data$primarydsm_NDD)
+
+# pharmacological treatment
+data$antipsychotic <- as.factor(data$antipsychotic)
+data$antidepressant <- as.factor(data$antidepressant)
+data$benzodiazepine <- as.factor(data$benzodiazepine)
+data$nonbenzodiazepine <- as.factor(data$nonbenzodiazepine)
+data$anticholinergic <- as.factor(data$anticholinergic)
+
+# other variables
+data$stillundercare <- as.factor(data$stillundercare)
+
+```
+
+# Data pre-processing
+
+## Select predictors
+
+The outcome variable, predictor variables, and other variables of interest are defined and stored in vectors.
+
+```{r}
+# outcome variable
+outcomeVariable <- "reoffendgeneral"
+
+# baseline variables
+baselineList <- c("age", "agefirstcrime", "PCLSVtotal", "male", "SUD", "PDB", "education", "MDFDR", "prevcrimeall")
+
+# SPECT predictors 
+spectList <- c("cerebellumdx", "cerebellumsin", "frontaldx", "frontalsin", "temporaldx", "temporalsin", "parietaldx", "parietalsin")
+
+# pharmacological treatment variables
+pharmaList <- c("antipsychotic", "antidepressant", "benzodiazepine", "nonbenzodiazepine", "anticholinergic")
+
+# other variables
+otherList <- c("timeatrisk", "primarydsmdiagnosis", "numberofaxis1", "numberofaxis2", "stillundercare", "totaldaysundercare2")
+
+# primary DSM-IV diagnosis
+primaryList <- c("primarydsm_psychosis", "primarydsm_mood", "primarydsm_pd", "primarydsm_DDA", "primarydsm_NDD")
+```
+
+## Missing data
+
+Look for missing data in the list of predictors and note how many rows (if any) contain missing values. Save that in a text file so it can be reported in text.
+
+```{r}
+# look for NAs in the predictor variables
+missing <- describe(data[c(baselineList, spectList, pharmaList, otherList, primaryList)])
+missingNames <- row.names(missing)
+tempMissing <- NULL
+
+# loop through list of predictor variables and save to temporary vector
+for (i in 1:length(missingNames)) {
+  tempMissing <- append(tempMissing,
+                        paste("There is/are",
+                              50-missing[i, 2], 
+                              "row/s missing in the", 
+                              missingNames[i],
+                              "variable"))
+}
+
+# capture output
+results_missing <- capture.output(tempMissing)
+
+# save output file to to .txt
+write(results_missing, file = "results/results_missing.txt")
+
+# remove from environment
+remove(i, missing, missingNames, tempMissing, results_missing)
+```
+
+## Drop missing data
+
+```{r}
+data <- data[complete.cases(data[, baselineList]), ]
+```
+
+# Data exploration
+
+## Reoffending
+
+```{r}
+# relevel the outcome variable
+contrasts(data[[outcomeVariable]]) <- contr.treatment(levels(data[[outcomeVariable]]),
+   base = which(levels(data[[outcomeVariable]]) == "yes"))
+
+# how many reoffended?
+results_reoffending <- capture.output(cat(
+  "In total,",
+  sum(data[outcomeVariable] == "yes"),
+  "patients reoffended overall, corresponding to",
+  as.numeric(round(prop.table(table(data[outcomeVariable]))[2], 2) * 100),
+  "percent of the sample.\n\n",
+  "In total,",
+  sum(data$reoffendviolent == "yes"),
+  "patients reoffended violently, corresponding to",
+  as.numeric(round(prop.table(table(data$reoffendviolent))[2], 2) * 100),
+  "percent of the sample."))
+
+# save output file to to .txt
+write(results_reoffending, file = "results/results_reoffending.txt")
+
+# remove from environment
+remove(results_reoffending)
+```
+
+## Dead and deported
+
+It is possible that not all patients were followed for the entire follow-up period; some may have died, and some may have been deported. Results are printed, captured and saved to a text file.
+
+```{r}
+# capture and save output
+results_deadanddeported <- capture.output(cat(
+  "In total,",
+  sum(data$dead == "yes"),
+  "patients died during their time at risk, and they were followed for mean =",
+  as.numeric(round(describe(data$daystodeath)[3], 0)),
+  "days, with sd =",
+  as.numeric(round(describe(data$daystodeath)[4], 0)),
+  "ranging between",
+  as.numeric(round(describe(data$daystodeath)[8], 0)),
+  "and",
+  as.numeric(round(describe(data$daystodeath)[9], 0)),
+  "days.",
+  "\n\nIn addition",
+  sum(data$deported == "yes"),
+  "patient was deported during the follow-up, and was followed for",
+  as.numeric(describe(data$daystodeportation)[3]),
+  "days."))
+
+# write to .txt
+write(results_deadanddeported, file = "results/results_deadanddeported.txt")
+
+# remove from environment
+remove(results_deadanddeported)
+```
+
+## Time at risk and age
+
+```{r}
+# capture and save output
+results_timeatriskandage <- capture.output(cat(
+  "In the entire sample, patients were followed for mean =",
+  as.numeric(round(describe(data$timeatrisk)[3]), 0),
+  "days, with sd =",
+  as.numeric(round(describe(data$timeatrisk)[4]), 0),
+  "ranging between",
+  as.numeric(round(describe(data$timeatrisk)[8]), 0),
+  "and",
+  as.numeric(round(describe(data$timeatrisk)[9]), 0),
+  "days.\n\nPatient's age at the time of FPI was median =",
+  as.numeric(round(describe(data$age)[5], 2)),
+  "years, with sd =",
+  as.numeric(round(describe(data$age)[4], 2)),
+  "ranging between",
+  as.numeric(round(describe(data$age)[8], 2)),
+  "and",
+  as.numeric(round(describe(data$age)[9], 2))))
+
+# write to .txt
+write(results_timeatriskandage, file = "results/results_timeatriskandage.txt")
+
+# remove from environment
+remove(results_timeatriskandage)
+```
+
+## Diagnostic overview
+
+```{r}
+# capture and save output
+results_diagnostics <- capture.output(cat(
+  "In total,",
+  sum(data$numberofaxis1 > 1),
+  "patients (",
+  round(sum(data$numberofaxis1 > 1) / nrow(data), 2)*100,
+  "percent) had more than one DSM-IV Axis I disorder, with a range of",
+  range(data$numberofaxis1)[1],"to",range(data$numberofaxis1)[2],
+  "\n\nIn total,",
+  sum(data$numberofaxis2 > 1),
+  "patients (",
+  round(sum(data$numberofaxis2 > 1) / nrow(data), 2)*100,
+  "percent) had more than one DSM-IV Axis II disorder."))
+
+# write to .txt
+write(results_diagnostics, file = "results/results_diagnostics.txt")
+
+# remove from environment
+remove(results_diagnostics)
+```
+
+## Committed crimes
+
+```{r}
+# this is a very ugly solution, but it works
+# I guess it could be done more elegantly with magrittr piping?
+crimecategory <- sprintf("cat%d", 1:51)
+crimecategory <- subset(data, select = crimecategory)
+crimecategory <- data.frame(lapply(crimecategory, as.factor), stringsAsFactors=FALSE)
+crimecategory <- as.matrix(crimecategory)
+crimecategory <- as.vector(crimecategory)
+crimecategory <- gsub(" ", "", crimecategory)
+crimecategory[!nzchar(crimecategory)] <- NA
+crimecategory <- crimecategory[!is.na(crimecategory)]
+crimecategory <- crimecategory[!duplicated(crimecategory)]
+
+# capture and save output
+results_crimes <- capture.output(cat(
+  "Crimes committed during the follow-up:\n",
+  paste(crimecategory, collapse = "\n")))
+
+# write to .txt
+write(results_crimes, file = "results/results_crimes.txt")
+
+# remove from environment
+remove(results_crimes, crimecategory)
+```
+
+## Correlations
+
+```{r}
+source("scripts/cor.R")
+
+# write to .txt
+write.table(corDat, "results/results_correlations.txt", sep = "\t", row.names = FALSE)
+remove(cList, corDat)
+```
+
+# Subset data
+
+Subset the data to remove everything we don't need for subsequent analyses.
+
+```{r}
+# select only columns that match the variable names in our lists
+idx <- match(c(outcomeVariable, baselineList, spectList, pharmaList, primaryList, otherList), names(data))
+
+# subset
+data <- data[, idx] 
+
+remove(idx)
+```
+
+# Table 1
+
+*Table 1* consists of an overview of all relevant variables. See *scripts/table_1.R* and *scripts/table_1_categorical.R* for details.
+
+```{r message=TRUE, warning=TRUE, include=FALSE}
+# source table scripts
+source("scripts/table_1_categorical.R")
+source("scripts/table_1.R")
+
+# att row names as a column
+table1$variable <- row.names(table1)
+
+# reorder columns
+table1 <- table1[, c(6, 1, 2, 3, 4, 5)]
+
+# add a row indicating group, bind together
+group <- c("", "All (n = 44)", "Non-recidivists (n = 28)", "Recidivists (n = 16)", "", "")
+table1 <- rbind(group, table1)
+
+write.table(table1, "results/table_1.txt", sep = "\t", row.names = FALSE)
+
+# keep environment clean
+remove(table1, group)
+```
+
+# Random Forest classification
+
+## Predictors
+
+Define which predictors to use in each step.
+
+```{r}
+# main analisys
+baselinePredictors <- baselineList
+extendedPredictors <- c(baselineList, spectList)
+
+# supplementary analysis
+pharmaPredictors <- c(baselineList, spectList, pharmaList)
+```
+
+## Formula specification
+
+```{r}
+formula_baseline <- paste(outcomeVariable, paste(baselinePredictors, collapse = "+"), sep = "~")
+formula_extended <- paste(outcomeVariable, paste(extendedPredictors, collapse = "+"), sep = "~")
+formula_pharma <- paste(outcomeVariable, paste(pharmaPredictors, collapse = "+"), sep = "~")
+```
+
+## Build models
+
+Models are built using the [randomForest](https://cran.r-project.org/web/packages/randomForest/index.html) package with 10 000 trees each. Down-sampling is used so that each tree uses an equal number of offenders versus reoffenders. 
+
+```{r}
+# primary analysis
+set.seed(seed)
+baselineModel <- randomForest(as.formula(formula_baseline),
+                      data = data,
+                      sampsize = c(16, 16),
+                      importance = TRUE,
+                      ntree = 10000,
+                      keep.inbag = TRUE,
+                      proximity = TRUE,
+                      keep.forest = TRUE)
+
+set.seed(seed)
+extendedModel <- randomForest(as.formula(formula_extended),
+                      data = data,
+                      sampsize = c(16, 16),
+                      importance = TRUE,
+                      ntree = 10000,
+                      keep.inbag = TRUE,
+                      proximity = TRUE,
+                      keep.forest = TRUE)
+
+# supplementary analysis
+set.seed(seed)
+pharmaModel <- randomForest(as.formula(formula_pharma),
+                      data = data,
+                      sampsize = c(16, 16),
+                      importance = TRUE,
+                      ntree = 10000,
+                      keep.inbag = TRUE,
+                      proximity = TRUE,
+                      keep.forest = TRUE)
+
+# keep environment clean
+remove(formula_baseline, formula_extended, formula_pharma)
+```
+
+# Results
+
+## Create confusion matrices
+
+```{r}
+# predict responses
+baselinePred <- predict(baselineModel, type = "response")
+extendedPred <- predict(extendedModel, type = "response")
+pharmaPred <- predict(pharmaModel, type = "response")
+
+# use 'caret' to create confusion matrix and associated metrics
+baselineMatrix <- confusionMatrix(baselinePred, data$reoffendgeneral, positive = "yes")
+extendedMatrix <- confusionMatrix(extendedPred, data$reoffendgeneral, positive = "yes")
+pharmaMatrix <- confusionMatrix(pharmaPred, data$reoffendgeneral, positive = "yes")
+
+# keep environment clean
+remove(baselinePred, extendedPred, pharmaPred)
+```
+
+## Calculate AUCs
+
+```{r}
+# baseline model
+baselinePredictions <- as.vector(baselineModel$votes[, 2])
+baselinePredictions <- prediction(baselinePredictions, data$reoffendgeneral)
+baselineAUC <- performance(baselinePredictions, "auc")
+baselineAUC <- baselineAUC@y.values[[1]]
+
+# extended model
+extendedPredictions <- as.vector(extendedModel$votes[, 2])
+extendedPredictions <- prediction(extendedPredictions, data$reoffendgeneral)
+extendedAUC <- performance(extendedPredictions, "auc")
+extendedAUC <- extendedAUC@y.values[[1]]
+
+# pharma model
+pharmaPredictions <- as.vector(pharmaModel$votes[, 2])
+pharmaPredictions <- prediction(pharmaPredictions, data$reoffendgeneral)
+pharmaAUC <- performance(pharmaPredictions, "auc")
+pharmaAUC <- pharmaAUC@y.values[[1]]
+
+# keep environment clean
+remove(baselinePredictions, extendedPredictions, pharmaPredictions)
+```
+
+## Calculate Brier score
+
+```{r}
+baselinePred <- predict(baselineModel, type = "prob")[, 2]
+extendedPred <- predict(extendedModel, type = "prob")[, 2]
+pharmaPred <- predict(pharmaModel, type = "prob")[, 2]
+
+resp <- as.numeric(data$reoffendgeneral) - 1
+
+# scaled
+baselineBrierScaled <- BrierScore(resp, baselinePred, scaled = TRUE)
+extendedBrierScaled <- BrierScore(resp, extendedPred, scaled = TRUE)
+pharmaBrierScaled <- BrierScore(resp, pharmaPred, scaled = TRUE)
+
+remove(baselinePred, extendedPred, pharmaPred, resp)
+```
+
+## Model performance metrics
+
+All relevant performance metrics are gathered and printed to a table.
+
+```{r}
+# store accuracy and related metrics
+baselineAccuracy <- as.data.frame(baselineMatrix[[3]])
+extendedAccuracy <- as.data.frame(extendedMatrix[[3]])
+pharmaAccuracy <- as.data.frame(pharmaMatrix[[3]])
+
+colnames(baselineAccuracy) <- c("Baseline")
+colnames(extendedAccuracy) <- c("Extended")
+colnames(pharmaAccuracy) <- c("Pharma")
+
+# store additional metrics
+baselineMetrics <- as.data.frame(baselineMatrix[[4]])
+extendedMetrics <- as.data.frame(extendedMatrix[[4]])
+pharmaMetrics <- as.data.frame(pharmaMatrix[[4]])
+
+colnames(baselineMetrics) <- c("Baseline")
+colnames(extendedMetrics) <- c("Extended")
+colnames(pharmaMetrics) <- c("Pharma")
+
+# bind together
+results <- rbind(cbind(baselineAccuracy, extendedAccuracy, pharmaAccuracy),
+                 cbind(baselineMetrics, extendedMetrics, pharmaMetrics))
+
+# AUC and Brier scores added with a quick and dirty fix
+AUCresults <- NULL
+AUCresults$Baseline <- baselineAUC
+AUCresults$Extended <- extendedAUC
+AUCresults$Pharma <- pharmaAUC
+AUCresults <- as.data.frame(AUCresults)
+
+brierresultsscaled <- NULL
+brierresultsscaled$Baseline <- baselineBrierScaled
+brierresultsscaled$Extended <- extendedBrierScaled
+brierresultsscaled$Pharma <- pharmaBrierScaled
+brierresultsscaled <- as.data.frame(brierresultsscaled)
+
+results <- rbind(brierresultsscaled, AUCresults, results)
+row.names(results)[1] <- "Scaled Brier score"
+row.names(results)[2] <- "AUC"
+results$statistic <- row.names(results)
+results <- results[, c(4, 1, 2, 3)]
+
+# final column names fix
+colnames(results) <- c("Statistic", "Baseline", "Extended", "Pharma")
+
+# keep only the statistics we're reporting in text (optional, may wish to keep everything)
+results <- results[c("Scaled Brier score", "AUC", "Accuracy", "AccuracyLower", "AccuracyUpper", "Sensitivity", "Specificity", "Pos Pred Value", "Neg Pred Value"), ]
+
+# keep environment clean
+remove(baselineAccuracy, extendedAccuracy, pharmaAccuracy,
+       baselineMetrics, extendedMetrics, pharmaMetrics,
+       baselineAUC, extendedAUC, pharmaAUC,
+       baselineMatrix, extendedMatrix, pharmaMatrix,
+       AUCresults)
+```
+
+## Save results
+
+```{r}
+write.table(results, "results/RF_results.txt", sep = "\t", row.names = FALSE)
+remove(results)
+```
+
+# Figures
+
+## Figure 2
+
+Figure 2 in the article visualizes variable importance in both models. See *scripts/figurescript.R* for more details.
+
+```{r}
+# for quick cosmetic changes, set various text sizes here
+textsize <- 2.5
+axissize <- 7
+axistitlesize <- 7
+legendsize <- 7
+legendtitlesize <- 7
+titlesize <- 7
+
+# source scripts
+source("scripts/figurescript.R")
+
+# combine the two plots into one
+plots <- plot_grid(p1, p2, nrow = 1, ncol = 2, labels = c("Baseline model", "Extended model"), label_size = 9, hjust = -0.1, label_fontface = "plain")
+
+# save in TIFF format
+tiff("figures/figure2.tiff", width = 7, height = 2.8, units = "in", res = 400, compression = "none")
+plots
+dev.off()
+
+# tidy up
+remove(p1, p2, plots)
+```
+
+## Figure 3
+
+Figure 3 in the manuscript is the partial dependence plots for the eight most important variables in the Baseline/Extended models. See *scripts/partialdepplot.R* for more details.
+
+### Baseline model
+
+```{r}
+# select the top 8 predictors from Baseline model and manually add formatted names
+partialPredictors <- NULL
+partialPredictors$loop <- row.names(MDA1[order(MDA1$MeanDecreaseAccuracy, decreasing = TRUE)[1:8], ])
+partialPredictors$names <- c("Cluster B personality disorder",
+                             "Age at first crime",
+                             "Age",
+                             "Substance use disorder",
+                             "PCL:SV total score",
+                             "Previous criminality",
+                             "Educational attainment",
+                             "Male sex")
+
+# specify baseline model
+model <- baselineModel
+
+# source pdp plot script
+source("scripts/partialdepplot.R")
+
+# arrange in grid
+pdpbaseline <- plot_grid(plot[[1]], plot[[2]], plot[[3]], plot[[4]],
+                   plot[[5]], plot[[6]], plot[[7]], plot[[8]],
+                   ncol = 4, nrow = 2)
+```
+
+### Extended model
+
+```{r}
+# select the top 8 predictors from Extended model and manually add formatted names
+partialPredictors <- NULL
+partialPredictors$loop <- row.names(MDA2[order(MDA2$MeanDecreaseAccuracy, decreasing = TRUE)[1:8], ])
+
+partialPredictors$names <- c("Right parietal lobe rCBF",
+                             "Cluster B personality disorder",
+                             "Age at first crime",
+                             "Left parietal lobe rCBF",
+                             "Age",
+                             "Left temporal lobe rCBF",
+                             "Right cerebellum rCBF",
+                             "Right temporal lobe rCBF")
+
+# specify extended model
+model <- extendedModel
+
+# source pdp plot script
+source("scripts/partialdepplot.R")
+
+# arrange in grid
+pdpextended <- plot_grid(plot[[1]], plot[[2]], plot[[3]], plot[[4]],
+                   plot[[5]], plot[[6]], plot[[7]], plot[[8]],
+                   ncol = 4, nrow = 2)
+```
+
+### Combined figure
+
+```{r}
+# combine baseline and extended plots
+pdpcombined <- plot_grid(pdpbaseline, pdpextended, nrow = 2, ncol = 1, labels = c("Baseline model", "Extended model"), label_size = 9, hjust = -0.1, label_fontface = "plain")
+
+# save in TIFF format
+tiff("figures/figure3.tiff", width = 6, height = 5.5, units = "in", res = 400, compression = "none")
+pdpcombined
+dev.off()
+
+# keep environment clean
+remove(MDA1, MDA2, numeric, categorical, i, var, plot, pdpbaseline, pdpextended, pdpcombined, temp, axissize, axistitlesize, legendsize, legendtitlesize, textsize, titlesize, model)
+```
+
+# Session info
+
+Write a text file with the session info, for future reference.
+
+```{r}
+sessInfo <- capture.output(sessionInfo())
+write(sessInfo, file = "sessioninfo.txt")
+
+remove(sessInfo)
+```
+
+# Stop timer
+
+Total running time is included for fun.
+
+```{r}
+runningtime <- capture.output(proc.time() - timer)
+write(runningtime, file = "runningtime.txt")
+```
